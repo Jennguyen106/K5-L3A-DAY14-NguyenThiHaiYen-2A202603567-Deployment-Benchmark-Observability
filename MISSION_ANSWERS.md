@@ -121,3 +121,93 @@ $ curl http://localhost/health
 $ curl -X POST http://localhost/ask -H "Content-Type: application/json" -d '{"question":"Explain microservices"}'
 {"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
 ```
+## Part 4: API Security
+
+### Exercise 4.1: API Key authentication (`04-api-gateway/develop/app.py`)
+Chạy: `AGENT_API_KEY=secret-key-123 python app.py`
+
+- **API key được check ở đâu?** Hàm `verify_api_key` (dòng 39–54), gắn vào `/ask` qua
+  `Depends(verify_api_key)` (dòng 70). Key đọc từ biến môi trường `AGENT_API_KEY` (dòng 35),
+  header tên `X-API-Key` (dòng 36).
+- **Sai key thì sao?** Thiếu key → 401 "Missing API key"; sai key → 403 "Invalid API key".
+  (Lưu ý: Part 6 yêu cầu cả thiếu lẫn sai đều trả 401.)
+- **Rotate key thế nào?** Đổi giá trị biến môi trường `AGENT_API_KEY` rồi restart app, không
+  sửa code. Thực tế nên hỗ trợ 2 key song song trong thời gian chuyển đổi để client kịp cập nhật.
+
+Kết quả test:
+```
+$ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+
+$ curl -i -X POST http://localhost:8000/ask -H "X-API-Key: wrong-key" -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 403 Forbidden
+content-type: application/json
+{"detail":"Invalid API key."}
+
+$ curl -i -X POST http://localhost:8000/ask -H "X-API-Key: secret-key-123" -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 200 OK
+content-type: application/json
+{"question":"Hello","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+### Exercise 4.2: JWT authentication (`04-api-gateway/production`)
+Lấy token tại `POST /auth/token` với tài khoản `student / demo123`:
+```
+$ curl -i -X POST http://localhost:8000/auth/token -H "Content-Type: application/json" -d '{"username":"student","password":"demo123"}'
+HTTP/1.1 200 OK
+{"access_token":"<TOKEN_ĐÃ_CHE>","token_type":"bearer","expires_in_minutes":60,...}
+
+$ curl -i -X POST http://localhost:8000/ask -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"question":"Explain JWT"}'
+HTTP/1.1 200 OK
+x-content-type-options: nosniff
+x-frame-options: DENY
+{"question":"Explain JWT","answer":"...","usage":{"requests_remaining":9,"budget_remaining_usd":1.9e-05}}
+```
+JWT flow: đăng nhập 1 lần → server ký token (header.payload.signature, HS256) chứa
+`sub`, `role`, `iat`, `exp` (hết hạn sau 60 phút) → các request sau gửi
+`Authorization: Bearer <token>` → server kiểm chữ ký và hạn dùng, không cần tra mật khẩu lại.
+Payload đọc được (base64) nhưng không sửa được vì sẽ sai chữ ký.
+
+Nhận xét: field `budget_remaining_usd` thực chất trả về chi phí ĐÃ dùng
+(`app.py` dòng 160 gán `usage.total_cost_usd`) → đặt tên sai, dễ gây hiểu nhầm.
+
+### Exercise 4.3: Rate limiting
+```
+Request 1: 200
+Request 2: 200
+Request 3: 200
+Request 4: 200
+Request 5: 200
+Request 6: 200
+Request 7: 200
+Request 8: 200
+Request 9: 200
+Request 10: 200
+Request 11: 429
+Request 12: 429
+Request 13: 429
+Request 14: 429
+Request 15: 429
+
+$ curl -i -X POST http://localhost:8000/ask -H "Authorization: Bearer $TOKEN" ... -d '{"question":"one more"}'
+HTTP/1.1 429 Too Many Requests
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795601860
+retry-after: 36
+```
+- **Algorithm:** Sliding window. Mỗi user có một `deque` lưu timestamp các request; mỗi lần gọi
+  xoá timestamp cũ hơn 60s, đếm số còn lại, vượt limit → 429 kèm `Retry-After` (`rate_limiter.py` dòng 36–65).
+- **Limit:** user 10 req/phút, admin 100 req/phút (`rate_limiter.py` dòng 86–87).
+- **Bypass cho admin:** không bỏ hẳn giới hạn mà dùng limiter riêng cao hơn theo role trong JWT:
+  `rate_limiter_admin if role == "admin" else rate_limiter_user` (`app.py` dòng 141). Tài khoản admin: `teacher`.
+- **Hạn chế:** state nằm trong RAM của process → restart là mất, nhiều instance thì đếm riêng.
+  Production cần lưu trong Redis (Part 6).
+
+### Exercise 4.4: Cost guard implementation
+- Trước khi gọi LLM: `check_budget(user_id)`: chi phí trong ngày của user ≥ $1 → **402 Payment Required**;
+  tổng toàn hệ thống ≥ $10/ngày → **503**; ≥ 80% budget → ghi cảnh báo.
+- Sau khi gọi LLM: `record_usage()` tính
+  `cost = input_tokens/1000 × giá_input + output_tokens/1000 × giá_output` và cộng dồn.
+- Reset theo ngày: bản ghi gắn với ngày hiện tại, sang ngày

@@ -46,7 +46,18 @@ chạy trên `localhost:8000` cố định, log bằng `print()` và **in thẳn
 
 Kết quả chạy bản production:
 ```
-<DÁN OUTPUT /health, /ready, /ask>
+Kết quả test bản production:
+```
+$ curl http://localhost:8000/health
+{"status":"ok","uptime_seconds":147.4,"version":"1.0.0","environment":"development","timestamp":"2026-11-25T09:23:44.781998+00:00"}
+
+$ curl http://localhost:8000/ready
+{"ready":true}
+
+$ curl -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question":"Hello"}'
+{"question":"Hello","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé.","model":"gpt-4o-mini"}
+```
+Log khởi động: `WARNING:root:OPENAI_API_KEY not set — using mock LLM` ... `Uvicorn running on http://0.0.0.0:8000`
 ```
 
 ## Part 2: Docker

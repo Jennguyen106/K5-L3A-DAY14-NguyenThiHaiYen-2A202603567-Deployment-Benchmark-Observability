@@ -332,3 +332,33 @@ Giải thích: 5 câu trong cùng một session được phục vụ bởi nhi�
 nhưng history vẫn đủ toàn bộ tin nhắn vì được lưu ở Redis dùng chung → agent stateless,
 scale ngang được mà không mất hội thoại. Script không tắt instance nào; nếu một instance chết,
 Nginx chuyển request sang instance còn lại và history vẫn còn trong Redis.
+## Part 6: Final Project
+
+Chạy trong `06-lab-complete/` (máy có Docker): `python check_production_ready.py`
+
+```
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+```
+
+Chi tiết đáng chú ý: image 238 MB; 429 sau 5 request (RATE_LIMIT_PER_MINUTE=5 từ env);
+restart agent vẫn 429 (state trong Redis); Redis down → /ready 503, /health 200;
+budget ≈ 0 → 402; 17 dòng log JSON hợp lệ; `docker stop` exit code 0 trong 0.8s.
+
+Thiết kế chính:
+- `/ask`: verify_api_key (401) → check_rate_limit (429 + Retry-After, sliding window bằng
+  Redis sorted set) → check_budget (402, key)

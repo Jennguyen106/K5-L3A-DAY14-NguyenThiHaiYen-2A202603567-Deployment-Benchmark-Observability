@@ -211,3 +211,124 @@ retry-after: 36
 - Sau khi gọi LLM: `record_usage()` tính
   `cost = input_tokens/1000 × giá_input + output_tokens/1000 × giá_output` và cộng dồn.
 - Reset theo ngày: bản ghi gắn với ngày hiện tại, sang ngày
+## Part 5: Scaling & Reliability
+
+### Exercise 5.1: Health checks (`05-scaling-reliability/develop/app.py`)
+- `GET /health` (liveness, dòng 104–145): trả 200 khi process còn chạy, kèm uptime, version,
+  và tự kiểm tra bộ nhớ bằng psutil: `ok`, hoặc `degraded` nếu RAM > 90%.
+  Platform gọi định kỳ, lỗi/timeout → restart container.
+- `GET /ready` (readiness, dòng 147–168): trả 503 khi `_is_ready = False` (đang khởi động hoặc
+  đang tắt), 200 khi sẵn sàng. Load balancer dùng để quyết định có chuyển traffic vào hay không.
+- **Liveness vs Readiness:** liveness hỏi "còn sống không?" (sai → restart);
+  readiness hỏi "nhận traffic được chưa?" (sai → tạm ngừng chuyển traffic, KHÔNG restart).
+  Ví dụ: Redis mất kết nối → `/health` vẫn 200 (restart không giải quyết được),
+  `/ready` trả 503 (đừng gửi request vào).
+
+Kết quả test:
+```
+$ curl http://localhost:8000/health
+{"status":"ok","uptime_seconds":13.9,"version":"1.0.0","environment":"development","timestamp":"2026-11-25T10:20:48.553508+00:00","checks":{"memory":{"status":"ok","used_percent":14.0}}}
+
+$ curl http://localhost:8000/ready
+{"ready":true,"in_flight_requests":1}
+```
+Ghi chú: `in_flight_requests = 1` là chính request `/ready` đang được xử lý
+(middleware `track_requests` tăng bộ đếm trước khi gọi endpoint).
+
+### Exercise 5.2: Graceful shutdown
+- Middleware `track_requests` (dòng 72–81) đếm số request đang xử lý (`_in_flight_requests`).
+- Khi nhận tín hiệu tắt, uvicorn gọi phần shutdown của `lifespan` (dòng 52–66):
+  1. Đặt `_is_ready = False` → ngừng nhận request mới (`/ready` trả 503).
+  2. Chờ request đang chạy hoàn thành, tối đa 30 giây.
+  3. Ghi log và thoát.
+- `uvicorn.run(..., timeout_graceful_shutdown=30)`; `handle_sigterm` chỉ ghi log,
+  uvicorn tự xử lý việc tắt.
+
+Log khi nhấn Ctrl+C:
+```
+2026-11-25 10:20:34,672 INFO Agent starting up...
+2026-11-25 10:20:34,672 INFO Loading model and checking dependencies...
+2026-11-25 10:20:34,873 INFO ✅ Agent is ready!
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:55108 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55110 - "GET /ready HTTP/1.1" 200 OK
+^CINFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-11-25 10:21:07,201 INFO 🔄 Graceful shutdown initiated...
+2026-11-25 10:21:07,202 INFO ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [5812]
+2026-11-25 10:21:07,202 INFO Received signal 2 — uvicorn will handle graceful shutdown
+```
+Nhận xét:
+- Signal 2 = SIGINT (Ctrl+C). Trên cloud, platform gửi SIGTERM (signal 15) khi tắt container;
+  uvicorn xử lý cả hai theo cùng cách graceful.
+- Không có dòng "Waiting for ... in-flight requests" vì lúc tắt không còn request nào đang chạy,
+  nên shutdown hoàn tất ngay (~1 ms). Nếu đang có request, app chờ tối đa 30s cho xong.
+
+### Exercise 5.3: Stateless design (`05-scaling-reliability/production/app.py`)
+- Session và conversation history lưu trong Redis: `save_session()` dùng
+  `SETEX session:<id>` với TTL 3600s, `load_session()` dùng `GET`.
+  Không lưu trong RAM của từng instance.
+- Lý do: khi scale nhiều instance, mỗi instance có bộ nhớ riêng. Request 1 vào instance A,
+  request 2 vào instance B → B không thấy history nếu lưu trong RAM.
+  Lưu ở Redis dùng chung thì instance nào cũng đọc được.
+- Mỗi response có `served_by` (INSTANCE_ID) để chứng minh nhiều instance cùng phục vụ một session.
+
+### Exercise 5.4: Load balancing
+Lệnh (trong `05-scaling-reliability/production/`, đã `touch .env.local`):
+`docker compose -p k5-day14-scaling up -d --build --scale agent=3`
+
+- Nginx (`nginx.conf`): `upstream agent_cluster { server agent:8000; }`. Docker DNS trả về
+  cả 3 container agent nên request được chia vòng tròn (round-robin).
+- `proxy_next_upstream error timeout http_503` + `proxy_next_upstream_tries 3`:
+  1 instance lỗi/503 thì Nginx tự chuyển sang instance khác.
+- Header `X-Served-By` cho biết instance nào đã xử lý. Stack mở cổng 8080, endpoint `POST /chat`.
+
+```
+$ docker compose -p k5-day14-scaling ps
+NAME                       IMAGE                    SERVICE   STATUS                   PORTS
+k5-day14-scaling-agent-1   k5-day14-scaling-agent   agent     Up 2 minutes (healthy)   8000/tcp
+k5-day14-scaling-agent-2   k5-day14-scaling-agent   agent     Up 2 minutes (healthy)   8000/tcp
+k5-day14-scaling-agent-3   k5-day14-scaling-agent   agent     Up 2 minutes (healthy)   8000/tcp
+k5-day14-scaling-nginx-1   nginx:alpine             nginx     Up 2 minutes             0.0.0.0:8080->80/tcp
+k5-day14-scaling-redis-1   redis:7-alpine           redis     Up 2 minutes (healthy)   6379/tcp
+
+$ docker compose -p k5-day14-scaling logs agent | tail -20
+agent-1  | ✅ Connected to Redis
+agent-1  | INFO:app:Starting instance instance-fee1fa
+agent-1  | INFO:app:Storage: Redis ✅
+agent-1  | INFO:     Uvicorn running on http://0.0.0.0:8000
+agent-1  | INFO:     127.0.0.1:53614 - "GET /health HTTP/1.1" 200 OK
+agent-1  | INFO:     172.18.0.6:55114 - "POST /chat HTTP/1.1" 200 OK
+agent-1  | INFO:     172.18.0.6:55114 - "POST /chat HTTP/1.1" 200 OK
+agent-1  | INFO:     127.0.0.1:40188 - "GET /health HTTP/1.1" 200 OK
+...
+```
+
+
+### Exercise 5.5: Test stateless
+```
+============================================================
+Stateless Scaling Demo
+============================================================
+Session ID: b096d192-e05d-4e62-98df-5fdf9f9ae7a4
+
+Request 1: [instance-fee1fa]  Q: What is Docker?
+Request 2: [instance-167db8]  Q: Why do we need containers?
+Request 3: [instance-83f0db]  Q: What is Kubernetes?
+Request 4: [instance-fee1fa]  Q: How does load balancing work?
+Request 5: [instance-167db8]  Q: What is Redis used for?
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'instance-83f0db', 'instance-fee1fa', 'instance-167db8'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+✅ Session history preserved across all instances via Redis!
+```
+Giải thích: 5 câu trong cùng một session được phục vụ bởi nhiều instance khác nhau (`served_by`),
+nhưng history vẫn đủ toàn bộ tin nhắn vì được lưu ở Redis dùng chung → agent stateless,
+scale ngang được mà không mất hội thoại. Script không tắt instance nào; nếu một instance chết,
+Nginx chuyển request sang instance còn lại và history vẫn còn trong Redis.

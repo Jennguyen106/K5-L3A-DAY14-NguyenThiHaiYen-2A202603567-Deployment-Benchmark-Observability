@@ -362,3 +362,46 @@ budget ≈ 0 → 402; 17 dòng log JSON hợp lệ; `docker stop` exit code 0 tr
 Thiết kế chính:
 - `/ask`: verify_api_key (401) → check_rate_limit (429 + Retry-After, sliding window bằng
   Redis sorted set) → check_budget (402, key)
+  ## Part 3: Cloud Deployment
+
+### Exercise 3.1: Railway deployment (agent Part 6)
+- URL: https://agent-production-d18ad049.up.railway.app
+- Lệnh: trong `06-lab-complete/`: `railway init` → `railway add --database redis`
+  → `railway add --service agent` → `railway up --service agent` → đặt biến → `railway domain --service agent`
+- Kết quả 4 lệnh kiểm tra (CP6): `/health` 200, `/ready` 200, `/ask` không key 401, `/ask` có key 200.
+- Screenshots: `screenshots/dashboard.png`, `screenshots/running.png`, `screenshots/test.png`.
+- Log trên Railway cho thấy app nghe theo `PORT` do platform cấp (`Uvicorn running on http://0.0.0.0:8080`),
+  2 worker, log JSON được Railway đọc thành dạng key=value.
+
+Sự cố gặp phải và cách xử lý:
+1. `railway up` lần đầu đẩy code vào nhầm service Redis (CLI tự link sau `railway add --database redis`)
+   → log `docker-entrypoint.sh: not found`. Sửa: tạo service `agent` riêng, deploy bằng `--service agent`.
+2. Biến môi trường đặt nhưng chưa deploy lại → log vẫn `environment="development"`, `/ready` 503.
+   Sửa: `railway redeploy --service agent`.
+3. Key dán vào terminal bị dính ký tự ẩn (38 ký tự thay vì 32) → request bị cắt kết nối.
+   Sửa: sinh key ngay trong terminal và đặt bằng `railway variable set`, không copy-dán.
+4. `REDIS_URL` tham chiếu service Redis cũ bị hỏng → `/ready` 503, `/ask` 503 ("Rate limiter unavailable",
+   fail closed). Sửa: đổi tham chiếu sang `${{Redis-ia08.REDIS_URL}}`, xóa Redis cũ.
+
+### So sánh `railway.toml` và `render.yaml`
+| | `railway.toml` | `render.yaml` |
+|---|---|---|
+| Phạm vi | Cấu hình build/deploy cho **1 service** | **Blueprint cả hạ tầng**: web service + Redis (Key Value) trong 1 file |
+| Build | `builder = "DOCKERFILE"`, `dockerfilePath` | `runtime: docker`, `dockerfilePath`, `dockerContext` |
+| Healthcheck | `healthcheckPath = "/health"`, `healthcheckTimeout` | `healthCheckPath: /health` |
+| Restart | `restartPolicyType = "ON_FAILURE"`, số lần thử | Render tự quản lý |
+| Biến môi trường / secret | Không khai báo trong file; đặt ở tab Variables hoặc `railway variable set` | Khai báo trong file: giá trị thường, `generateValue: true` (tự sinh secret), `fromService` (lấy `connectionString` của Redis) |
+| Redis | Tạo service riêng (`railway add --database redis`), nối bằng tham chiếu `${{Redis.REDIS_URL}}` | Khai báo service `keyvalue` ngay trong blueprint |
+| Ghi chú | Railway báo Config-as-Code (`railway.toml`) sắp được thay bằng `.railway/railway.ts`, vẫn dùng được đến 01/12/2026 | |
+
+Tóm lại: `railway.toml` gọn, chỉ mô tả cách build/chạy, phần còn lại cấu hình trên dashboard hoặc CLI;
+`render.yaml` là Infrastructure-as-Code đầy đủ hơn, tái tạo được cả stack (agent + Redis + biến) từ một file.
+
+### Exercise 3.3: Cloud Run CI/CD pipeline (`03-cloud-deployment/production-cloud-run/`)
+`cloudbuild.yaml` định nghĩa pipeline 4 bước chạy tuần tự (`waitFor`): (1) **test**: cài requirements và chạy
+`pytest`, test fail thì dừng; (2) **build**: build Docker image, gắn tag `$COMMIT_SHA` và `latest`, dùng
+`--cache-from` để tận dụng layer cache; (3) **push** image lên Container Registry; (4) **deploy**:
+`gcloud run deploy` image theo đúng commit lên region `asia-southeast1`, `min-instances=1` (tránh cold start),
+`max-instances=10`, secret lấy từ Secret Manager. `service.yaml` mô tả service Knative tương ứng: autoscale
+1–10 instance theo `containerConcurrency: 80`, giới hạn CPU/RAM, `livenessProbe` gọi `/health`,
+`startupProbe` gọi `/ready`, `AGENT_API_KEY`/`OPENAI_API_KEY` lấy từ secret thay vì ghi thẳng.
